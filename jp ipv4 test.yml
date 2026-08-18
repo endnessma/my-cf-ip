@@ -1,0 +1,82 @@
+name: 优选 IPv4（443端口，带编号标签）
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: TCP 443 端口延迟测试（针对 gd.189.cn，取前20，带 #JP v4 标签）
+        run: |
+          set -e
+
+          # 生成 IP 列表（172.64.229.1 ~ 254）
+          for i in {1..254}; do
+            echo "172.64.229.$i"
+          done > ip_list.txt
+
+          # 测试函数：每个 IP 通过 gd.189.cn 测延迟
+          test_ip() {
+            ip=$1
+            safe_ip=$(echo "$ip" | tr '.' '_')
+            tmp_file="/tmp/result_${safe_ip}.txt"
+
+            time=$(curl -o /dev/null -s -w "%{time_starttransfer}" \
+              --connect-timeout 3 \
+              -k \
+              --resolve "gd.189.cn:443:${ip}" \
+              "https://gd.189.cn" 2>/dev/null)
+
+            if [ -n "$time" ] && [ "$time" != "0.000" ] && [ "$time" != "0" ]; then
+              echo "$ip $time" > "$tmp_file"
+            fi
+          }
+          export -f test_ip
+
+          # 并行执行（50 并发）
+          cat ip_list.txt | xargs -P 50 -I {} bash -c 'test_ip "$@"' _ {}
+
+          # 合并所有临时文件
+          cat /tmp/result_*.txt 2>/dev/null | sort -k2 -n > raw_result.txt || true
+          rm -f /tmp/result_*.txt
+
+          total=$(wc -l < raw_result.txt 2>/dev/null || echo 0)
+          echo "✅ 可用的 IP 总数：$total"
+
+          if [ "$total" -eq 0 ]; then
+            echo "未找到任何可用的 443 端口 IP（针对 gd.189.cn）" > best_ips_test.txt
+            echo "未找到任何可用的 443 端口 IP（针对 gd.189.cn）" > best_ips_iponly_test.txt
+            echo "⚠️  未找到可用 IP，已写入错误信息。"
+            exit 0
+          fi
+
+          head -20 raw_result.txt > sorted.txt
+
+          # 生成带延迟和标签的结果（延迟单位转为毫秒）
+          awk '{printf "%-18s %.2f ms  #JP v4 %02d\n", $1 ":443", $2*1000, NR}' sorted.txt > best_ips_test.txt
+
+          # 生成仅含 IP:443#JP v4 编号 的结果
+          n=1
+          while read ip delay; do
+            printf "%s#JP v4 %02d\n" "${ip}:443" $n
+            ((n++))
+          done < sorted.txt > best_ips_iponly_test.txt
+
+          echo "📋 已生成 best_ips_test.txt 和 best_ips_iponly_test.txt（基于 gd.189.cn 延迟）"
+
+      - name: 提交并推送结果
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git add best_ips_test.txt best_ips_iponly_test.txt
+          git diff --staged --quiet || git commit -m "自动更新优选IP（443端口，针对gd.189.cn，$(date +'%Y-%m-%d %H:%M:%S')）"
+          git push
