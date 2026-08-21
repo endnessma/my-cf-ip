@@ -2,7 +2,7 @@ name: 优选 IPv4（443端口，带编号标签）
 
 on:
   schedule:
-    - cron: '0 */2 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
@@ -19,9 +19,11 @@ jobs:
         run: |
           set -e  # 出错即停，便于调试
 
-          # 生成 IP 列表（172.64.229.1 ~ 254）
-          for i in {1..254}; do
-            echo "172.64.229.$i"
+          # 生成 IP 列表（两个 CIDR：172.64.229.0/24 和 104.18.33.0/24）
+          for prefix in 172.64.229 104.18.33; do
+            for i in {1..254}; do
+              echo "$prefix.$i"
+            done
           done > ip_list.txt
 
           # 测试函数：每个 IP 独立输出到临时文件（避免并行写冲突）
