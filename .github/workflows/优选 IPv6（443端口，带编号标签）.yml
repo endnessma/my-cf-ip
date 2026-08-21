@@ -2,7 +2,7 @@ name: 优选 IPv6（443端口，带编号标签）
 
 on:
   schedule:
-    - cron: '0 */12 * * *'
+    - cron: '0 */2 * * *'
   workflow_dispatch:
 
 jobs:
