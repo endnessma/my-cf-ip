@@ -21,7 +21,7 @@ jobs:
 
           # ==================== 你的实际配置 ====================
           DOMAIN="cmwk.eccome.ccwu.cc"
-          URI_PATH="/proxyip=kr.william.us.ci"
+          URI_PATH="/proxyip=ProxyIP.US.CMLiussss.net"
           CIDRS=("172.64.229" )   # 需要新增/删除段，改这里就行
           TOP_N=10                            # 取前多少个结果
           CONCURRENCY=100                     # 并发数
