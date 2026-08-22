@@ -91,10 +91,10 @@ jobs:
           sort -k2 -n raw_result.txt | head -20 > sorted.txt
 
           # 5. 生成结果文件
-          awk '{printf "%-18s %.2f ms  #电信优选 %02d\n", $1 ":443", $2, NR}' sorted.txt > best_ips.txt
+          awk '{printf "%-18s %.2f ms  #GHv4 %02d\n", $1 ":443", $2, NR}' sorted.txt > best_ips.txt
           n=1
           while read ip delay; do
-            printf "%s#电信优选 %02d\n" "${ip}:443" $n
+            printf "%s#GHv4 %02d\n" "${ip}:443" $n
             ((n++))
           done < sorted.txt > best_ips_iponly.txt
 
