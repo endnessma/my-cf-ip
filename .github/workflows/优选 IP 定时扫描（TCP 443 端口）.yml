@@ -23,7 +23,7 @@ jobs:
           DOMAIN="cmwk.eccome.ccwu.cc"
           URI_PATH="/proxyip=kr.william.us.ci"
           CIDRS=("172.64.229" "104.18.33")   # 需要新增/删除段，改这里就行
-          TOP_N=20                            # 取前多少个结果
+          TOP_N=10                            # 取前多少个结果
           CONCURRENCY=100                     # 并发数
           EXPECT_STATUS="101,200,204"         # 认为"通"的 HTTP 状态码（VLESS+XHTTP 常见 101/200，视你的实现调整）
           # =====================================================
