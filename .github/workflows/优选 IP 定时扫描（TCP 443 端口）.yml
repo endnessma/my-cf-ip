@@ -1,9 +1,9 @@
-name: 优选 IPv4（443端口，带编号标签）
+name: 电信优选 IPv4（XHTTP精准扫描）
 
 on:
   schedule:
-    - cron: '0 */3 * * *'
-  workflow_dispatch:
+    - cron: '0 */4 * * *'   # 每4小时扫描一次，适配电信路由波动
+  workflow_dispatch:        # 支持手动触发
 
 jobs:
   scan:
@@ -13,83 +13,121 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v5   # 升级至 v5，支持 Node.js 24
+        uses: actions/checkout@v5
 
-      - name: TCP 443 端口延迟测试（取前20，带 #JP v4 标签）
+      - name: 精准扫描（TLS+HTTP验证，抖动过滤）
         run: |
-          set -e  # 出错即停，便于调试
+          set -e
 
-          # 生成 IP 列表（172.64.229.1 ~ 254）
-          for i in {1..254}; do
-            echo "172.64.229.$i"
-          done > ip_list.txt
+          # ==================== 你的实际配置 ====================
+          DOMAIN="cmwk.eccome.ccwu.cc"
+          PATH="/proxyip=tw.william.us.ci"   # 请确保你的 Worker 支持此路径
+          # =====================================================
 
-          # 测试函数：每个 IP 独立输出到临时文件（避免并行写冲突）
+          echo "🔍 目标域名: $DOMAIN, 路径: $PATH"
+
+          # 1. 生成多C段 IP 池（涵盖 CF 对电信友好的常用段）
+          echo "正在生成 IP 池（覆盖多个 C 段）..."
+          rm -f ip_list.txt
+          # 172.64.224.* ~ 243.*
+          for seg in {224..243}; do
+            for i in {1..254}; do
+              echo "172.64.$seg.$i"
+            done
+          done >> ip_list.txt
+          # 104.16.* ~ 31.*
+          for seg in {16..31}; do
+            for i in {1..254}; do
+              echo "104.16.$seg.$i"
+            done
+          done >> ip_list.txt
+          # 104.24.* 和 172.67.* (0~10 段)
+          for seg in {0..10}; do
+            for i in {1..254}; do
+              echo "104.24.$seg.$i"
+              echo "172.67.$seg.$i"
+            done
+          done >> ip_list.txt
+
+          total_ips=$(wc -l < ip_list.txt)
+          echo "📡 总待测 IP 数量：$total_ips"
+
+          # 2. 测试函数：使用 --resolve 强制 SNI，连续测2次，过滤抖动
           test_ip() {
             ip=$1
-            # 将 IP 中的点替换为下划线，用作文件名
-            safe_ip=$(echo "$ip" | tr '.' '_')
-            tmp_file="/tmp/result_${safe_ip}.txt"
+            domain="$2"
+            path="$3"
             
-            time=$(curl -o /dev/null -s -w "%{time_connect}" --connect-timeout 3 -k "https://${ip}:443" 2>/dev/null)
-            if [ -n "$time" ] && [ "$time" != "0.000" ] && [ "$time" != "0" ]; then
-              echo "$ip $time" > "$tmp_file"
+            # 第一次测试
+            t1=$(curl -o /dev/null -s -w "%{time_total}" \
+              --connect-timeout 1.5 \
+              --max-time 4 \
+              -k \
+              --resolve "${domain}:443:${ip}" \
+              -H "Host: ${domain}" \
+              "https://${domain}${path}" 2>/dev/null || echo "999")
+            
+            if [ "$t1" = "999" ] || [ "$t1" = "0.000" ]; then
+              return
+            fi
+
+            # 第二次测试
+            t2=$(curl -o /dev/null -s -w "%{time_total}" \
+              --connect-timeout 1.5 \
+              --max-time 4 \
+              -k \
+              --resolve "${domain}:443:${ip}" \
+              -H "Host: ${domain}" \
+              "https://${domain}${path}" 2>/dev/null || echo "999")
+            
+            if [ "$t2" = "999" ]; then
+              return
+            fi
+
+            # 计算平均延迟（毫秒）
+            avg_ms=$(echo "scale=2; ($t1 + $t2) / 2 * 1000" | bc)
+            # 计算抖动（绝对值）
+            diff=$(echo "scale=2; ($t1 - $t2)" | bc | tr -d '-')
+            
+            # 抖动阈值：超过 300ms 则丢弃
+            stable_check=$(echo "$diff < 0.3" | bc)
+            if [ "$stable_check" -eq 1 ]; then
+              echo "$ip $avg_ms"
             fi
           }
           export -f test_ip
 
-          # 并行执行（50 个并发），每个 IP 独立写文件
-          cat ip_list.txt | xargs -P 50 -I {} bash -c 'test_ip "$@"' _ {}
+          # 3. 并行执行（并发数 80，充分利用 Runner）
+          cat ip_list.txt | xargs -P 80 -I {} bash -c 'test_ip "$@" "$DOMAIN" "$PATH"' _ {} > raw_result.txt || true
 
-          # 合并所有临时文件到 raw_result.txt（按行排序）
-          cat /tmp/result_*.txt 2>/dev/null | sort -k2 -n > raw_result.txt || true
-          rm -f /tmp/result_*.txt
-
-          # 调试：打印原始结果行数
+          # 4. 排序取前 20
           total=$(wc -l < raw_result.txt 2>/dev/null || echo 0)
-          echo "✅ 可用的 IP 总数：$total"
+          echo "✅ 有效可用 IP 数（已过滤抖动）：$total"
 
-          # 如果无结果，生成提示文件并退出（仍会提交，便于记录）
           if [ "$total" -eq 0 ]; then
-            echo "未找到任何可用的 443 端口 IP" > best_ips.txt
-            echo "未找到任何可用的 443 端口 IP" > best_ips_iponly.txt
-            echo "⚠️  未找到可用 IP，已写入错误信息。"
+            echo "⚠️ 未找到可用 IP，保留上次结果" > best_ips.txt
+            echo "未找到" > best_ips_iponly.txt
             exit 0
           fi
 
-          # 取前 20 个最优（延迟最低）
-          head -20 raw_result.txt > sorted.txt
+          sort -k2 -n raw_result.txt | head -20 > sorted.txt
 
-          # 调试：打印 sorted.txt 内容（验证格式）
-          echo "--- sorted.txt 内容（前20行） ---"
-          cat sorted.txt
-          echo "----------------------------------"
-
-          # 生成带延迟和标签的结果（用于展示）
-          awk '{printf "%-18s %.2f ms  #JP v4 %02d\n", $1 ":443", $2*1000, NR}' sorted.txt > best_ips.txt
-
-          # 生成仅含 IP:443#JP v4 编号 的结果（每行一个，确保换行）
+          # 5. 生成带延迟和编号标签的结果
+          awk '{printf "%-18s %.2f ms  #电信优选 %02d\n", $1 ":443", $2, NR}' sorted.txt > best_ips.txt
+          
           n=1
           while read ip delay; do
-            printf "%s#JP v4 %02d\n" "${ip}:443" $n
+            printf "%s#电信优选 %02d\n" "${ip}:443" $n
             ((n++))
           done < sorted.txt > best_ips_iponly.txt
 
-          # 调试：打印最终生成的文件内容
-          echo "--- best_ips.txt 内容 ---"
+          echo "--- 本次 Top 20 结果 ---"
           cat best_ips.txt
-          echo "--------------------------"
-          echo "--- best_ips_iponly.txt 内容 ---"
-          cat best_ips_iponly.txt
-          echo "--------------------------------"
-
-          echo "📋 已生成 best_ips.txt 和 best_ips_iponly.txt"
 
       - name: 提交并推送结果
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git add best_ips.txt best_ips_iponly.txt
-          # 若文件无变化则跳过提交，否则提交并推送
-          git diff --staged --quiet || git commit -m "自动更新优选IP（443端口，带编号标签 $(date +'%Y-%m-%d %H:%M:%S')）"
+          git diff --staged --quiet || git commit -m "自动更新电信优选IP $(date +'%Y-%m-%d %H:%M:%S')"
           git push
