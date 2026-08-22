@@ -2,7 +2,7 @@ name: 电信优选 IPv4（XHTTP精准扫描 - 限定两段）
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
           set -e
 
           # ==================== 你的实际配置 ====================
-          DOMAIN="cmwk.eccome.ccwu.cc"
+          DOMAIN="cmpg.endnessma.cc.cd/"
           URI_PATH="/proxyip=kr.william.us.ci"
           CIDRS=("172.64.229" "104.18.33")   # 需要新增/删除段，改这里就行
           TOP_N=20                            # 取前多少个结果
