@@ -1,8 +1,8 @@
-name: 电信优选 IPv4（XHTTP精准扫描）
+name: 电信优选 IPv4（XHTTP精准扫描 - 限定两段）
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 */3* * *'
   workflow_dispatch:
 
 jobs:
@@ -19,45 +19,34 @@ jobs:
         run: |
           set -e
 
-          # 安装 bc（用于浮点运算）
+          # 安装 bc（浮点运算依赖）
           sudo apt-get update
           sudo apt-get install -y bc
 
           # ==================== 你的实际配置 ====================
           DOMAIN="cmwk.eccome.ccwu.cc"
-          URI_PATH="/proxyip=tw.william.us.ci"   # 注意变量名已改为 URI_PATH
-          export DOMAIN URI_PATH                 # 导出供子 shell 使用
+          URI_PATH="/proxyip=tw.william.us.ci"
+          export DOMAIN URI_PATH
           # =====================================================
 
           echo "🔍 目标域名: $DOMAIN, 路径: $URI_PATH"
 
-          # 1. 生成多C段 IP 池
-          echo "正在生成 IP 池..."
+          # 1. 只生成两个指定 C 段的 IP 列表
+          echo "正在生成 IP 池（仅 172.64.229.* 和 104.18.33.*）..."
           rm -f ip_list.txt
-          for seg in {224..243}; do
-            for i in {1..254}; do
-              echo "172.64.$seg.$i"
-            done
+          for i in {1..254}; do
+            echo "172.64.229.$i"
           done >> ip_list.txt
-          for seg in {16..31}; do
-            for i in {1..254}; do
-              echo "104.16.$seg.$i"
-            done
-          done >> ip_list.txt
-          for seg in {0..10}; do
-            for i in {1..254}; do
-              echo "104.24.$seg.$i"
-              echo "172.67.$seg.$i"
-            done
+          for i in {1..254}; do
+            echo "104.18.33.$i"
           done >> ip_list.txt
 
           total_ips=$(wc -l < ip_list.txt)
           echo "📡 总待测 IP 数量：$total_ips"
 
-          # 2. 测试函数（使用环境变量 DOMAIN 和 URI_PATH）
+          # 2. 测试函数（双测+抖动过滤）
           test_ip() {
             ip=$1
-            # 第一次测试
             t1=$(curl -o /dev/null -s -w "%{time_total}" \
               --connect-timeout 1.5 \
               --max-time 4 \
@@ -68,7 +57,6 @@ jobs:
             if [ "$t1" = "999" ] || [ "$t1" = "0.000" ]; then
               return
             fi
-            # 第二次测试
             t2=$(curl -o /dev/null -s -w "%{time_total}" \
               --connect-timeout 1.5 \
               --max-time 4 \
@@ -79,9 +67,7 @@ jobs:
             if [ "$t2" = "999" ]; then
               return
             fi
-            # 平均延迟（毫秒）
             avg_ms=$(echo "scale=2; ($t1 + $t2) / 2 * 1000" | bc)
-            # 抖动过滤
             diff=$(echo "scale=2; ($t1 - $t2)" | bc | tr -d '-')
             stable=$(echo "$diff < 0.3" | bc)
             if [ "$stable" -eq 1 ]; then
@@ -90,8 +76,8 @@ jobs:
           }
           export -f test_ip
 
-          # 3. 并行执行（并发 80）
-          cat ip_list.txt | xargs -P 80 -I {} bash -c 'test_ip "$1"' _ {} > raw_result.txt || true
+          # 3. 并行执行（并发数 50 即可，因为 IP 少了）
+          cat ip_list.txt | xargs -P 50 -I {} bash -c 'test_ip "$1"' _ {} > raw_result.txt || true
 
           # 4. 排序取前 20
           total=$(wc -l < raw_result.txt 2>/dev/null || echo 0)
@@ -118,7 +104,7 @@ jobs:
       - name: 提交并推送结果
         run: |
           git config --local user.name "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.email "github-actions[bot]@users.github.com"
           git add best_ips.txt best_ips_iponly.txt
           git diff --staged --quiet || git commit -m "自动更新电信优选IP $(date +'%Y-%m-%d %H:%M:%S')"
           git push
