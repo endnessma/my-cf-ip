@@ -2,8 +2,8 @@ name: 电信优选 IPv4（XHTTP精准扫描）
 
 on:
   schedule:
-    - cron: '0 */4 * * *'   # 每4小时扫描一次，适配电信路由波动
-  workflow_dispatch:        # 支持手动触发
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
 
 jobs:
   scan:
@@ -19,29 +19,31 @@ jobs:
         run: |
           set -e
 
+          # 安装 bc（用于浮点运算）
+          sudo apt-get update
+          sudo apt-get install -y bc
+
           # ==================== 你的实际配置 ====================
           DOMAIN="cmwk.eccome.ccwu.cc"
-          PATH="/proxyip=tw.william.us.ci"   # 请确保你的 Worker 支持此路径
+          URI_PATH="/proxyip=tw.william.us.ci"   # 注意变量名已改为 URI_PATH
+          export DOMAIN URI_PATH                 # 导出供子 shell 使用
           # =====================================================
 
-          echo "🔍 目标域名: $DOMAIN, 路径: $PATH"
+          echo "🔍 目标域名: $DOMAIN, 路径: $URI_PATH"
 
-          # 1. 生成多C段 IP 池（涵盖 CF 对电信友好的常用段）
-          echo "正在生成 IP 池（覆盖多个 C 段）..."
+          # 1. 生成多C段 IP 池
+          echo "正在生成 IP 池..."
           rm -f ip_list.txt
-          # 172.64.224.* ~ 243.*
           for seg in {224..243}; do
             for i in {1..254}; do
               echo "172.64.$seg.$i"
             done
           done >> ip_list.txt
-          # 104.16.* ~ 31.*
           for seg in {16..31}; do
             for i in {1..254}; do
               echo "104.16.$seg.$i"
             done
           done >> ip_list.txt
-          # 104.24.* 和 172.67.* (0~10 段)
           for seg in {0..10}; do
             for i in {1..254}; do
               echo "104.24.$seg.$i"
@@ -52,69 +54,58 @@ jobs:
           total_ips=$(wc -l < ip_list.txt)
           echo "📡 总待测 IP 数量：$total_ips"
 
-          # 2. 测试函数：使用 --resolve 强制 SNI，连续测2次，过滤抖动
+          # 2. 测试函数（使用环境变量 DOMAIN 和 URI_PATH）
           test_ip() {
             ip=$1
-            domain="$2"
-            path="$3"
-            
             # 第一次测试
             t1=$(curl -o /dev/null -s -w "%{time_total}" \
               --connect-timeout 1.5 \
               --max-time 4 \
               -k \
-              --resolve "${domain}:443:${ip}" \
-              -H "Host: ${domain}" \
-              "https://${domain}${path}" 2>/dev/null || echo "999")
-            
+              --resolve "${DOMAIN}:443:${ip}" \
+              -H "Host: ${DOMAIN}" \
+              "https://${DOMAIN}${URI_PATH}" 2>/dev/null || echo "999")
             if [ "$t1" = "999" ] || [ "$t1" = "0.000" ]; then
               return
             fi
-
             # 第二次测试
             t2=$(curl -o /dev/null -s -w "%{time_total}" \
               --connect-timeout 1.5 \
               --max-time 4 \
               -k \
-              --resolve "${domain}:443:${ip}" \
-              -H "Host: ${domain}" \
-              "https://${domain}${path}" 2>/dev/null || echo "999")
-            
+              --resolve "${DOMAIN}:443:${ip}" \
+              -H "Host: ${DOMAIN}" \
+              "https://${DOMAIN}${URI_PATH}" 2>/dev/null || echo "999")
             if [ "$t2" = "999" ]; then
               return
             fi
-
-            # 计算平均延迟（毫秒）
+            # 平均延迟（毫秒）
             avg_ms=$(echo "scale=2; ($t1 + $t2) / 2 * 1000" | bc)
-            # 计算抖动（绝对值）
+            # 抖动过滤
             diff=$(echo "scale=2; ($t1 - $t2)" | bc | tr -d '-')
-            
-            # 抖动阈值：超过 300ms 则丢弃
-            stable_check=$(echo "$diff < 0.3" | bc)
-            if [ "$stable_check" -eq 1 ]; then
+            stable=$(echo "$diff < 0.3" | bc)
+            if [ "$stable" -eq 1 ]; then
               echo "$ip $avg_ms"
             fi
           }
           export -f test_ip
 
-          # 3. 并行执行（并发数 80，充分利用 Runner）
-          cat ip_list.txt | xargs -P 80 -I {} bash -c 'test_ip "$@" "$DOMAIN" "$PATH"' _ {} > raw_result.txt || true
+          # 3. 并行执行（并发 80）
+          cat ip_list.txt | xargs -P 80 -I {} bash -c 'test_ip "$1"' _ {} > raw_result.txt || true
 
           # 4. 排序取前 20
           total=$(wc -l < raw_result.txt 2>/dev/null || echo 0)
           echo "✅ 有效可用 IP 数（已过滤抖动）：$total"
-
           if [ "$total" -eq 0 ]; then
-            echo "⚠️ 未找到可用 IP，保留上次结果" > best_ips.txt
+            echo "⚠️ 未找到可用 IP" > best_ips.txt
             echo "未找到" > best_ips_iponly.txt
             exit 0
           fi
 
           sort -k2 -n raw_result.txt | head -20 > sorted.txt
 
-          # 5. 生成带延迟和编号标签的结果
+          # 5. 生成结果文件
           awk '{printf "%-18s %.2f ms  #电信优选 %02d\n", $1 ":443", $2, NR}' sorted.txt > best_ips.txt
-          
           n=1
           while read ip delay; do
             printf "%s#电信优选 %02d\n" "${ip}:443" $n
