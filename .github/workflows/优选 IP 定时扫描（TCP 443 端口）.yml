@@ -15,90 +15,98 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v5
 
-      - name: 精准扫描（TLS+HTTP验证，抖动过滤）
+      - name: 精准扫描（TLS+HTTP验证，三次取中位数）
         run: |
           set -e
-
-          # 安装 bc（浮点运算依赖）
-          sudo apt-get update
-          sudo apt-get install -y bc
 
           # ==================== 你的实际配置 ====================
           DOMAIN="cmwk.eccome.ccwu.cc"
           URI_PATH="/proxyip=kr.william.us.ci"
-          export DOMAIN URI_PATH
+          CIDRS=("172.64.229" "104.18.33")   # 需要新增/删除段，改这里就行
+          TOP_N=20                            # 取前多少个结果
+          CONCURRENCY=100                     # 并发数
+          EXPECT_STATUS="101,200,204"         # 认为"通"的 HTTP 状态码（VLESS+XHTTP 常见 101/200，视你的实现调整）
           # =====================================================
+          export DOMAIN URI_PATH EXPECT_STATUS
 
           echo "🔍 目标域名: $DOMAIN, 路径: $URI_PATH"
 
-          # 1. 只生成两个指定 C 段的 IP 列表
-          echo "正在生成 IP 池（仅 172.64.229.* 和 104.18.33.*）..."
-          rm -f ip_list.txt
-          for i in {1..254}; do
-            echo "172.64.229.$i"
-          done >> ip_list.txt
-          for i in {1..254}; do
-            echo "104.18.33.$i"
-          done >> ip_list.txt
-
+          # 1. 生成 IP 池
+          echo "正在生成 IP 池..."
+          : > ip_list.txt
+          for cidr in "${CIDRS[@]}"; do
+            for i in $(seq 1 254); do
+              echo "${cidr}.${i}"
+            done >> ip_list.txt
+          done
           total_ips=$(wc -l < ip_list.txt)
           echo "📡 总待测 IP 数量：$total_ips"
 
-          # 2. 测试函数（双测+抖动过滤）
+          # 2. 测试函数：三次采样，取中位数；同时校验 HTTP 状态码，避免"建连快但内容不对"的假阳性
           test_ip() {
             ip=$1
-            t1=$(curl -o /dev/null -s -w "%{time_total}" \
-              --connect-timeout 1.5 \
-              --max-time 4 \
-              -k \
-              --resolve "${DOMAIN}:443:${ip}" \
-              -H "Host: ${DOMAIN}" \
-              "https://${DOMAIN}${URI_PATH}" 2>/dev/null || echo "999")
-            if [ "$t1" = "999" ] || [ "$t1" = "0.000" ]; then
+            times=()
+            status=""
+            for n in 1 2 3; do
+              out=$(curl -o /dev/null -s \
+                -w "%{http_code} %{time_total}" \
+                --connect-timeout 1.5 \
+                --max-time 4 \
+                -k \
+                --resolve "${DOMAIN}:443:${ip}" \
+                -H "Host: ${DOMAIN}" \
+                "https://${DOMAIN}${URI_PATH}" 2>/dev/null) || out="000 999"
+
+              code=$(echo "$out" | awk '{print $1}')
+              t=$(echo "$out" | awk '{print $2}')
+
+              # 第一次采样顺便记录状态码，用于后面校验
+              [ -z "$status" ] && status="$code"
+
+              # 超时/连接失败直接丢弃这个 IP，不用跑满三次
+              if [ "$code" = "000" ]; then
+                return
+              fi
+              times+=("$t")
+            done
+
+            # 状态码校验：不在预期列表里的直接丢弃（过滤"连上但不是你的节点"的噪音 IP）
+            if [[ ",${EXPECT_STATUS}," != *",${status},"* ]]; then
               return
             fi
-            t2=$(curl -o /dev/null -s -w "%{time_total}" \
-              --connect-timeout 1.5 \
-              --max-time 4 \
-              -k \
-              --resolve "${DOMAIN}:443:${ip}" \
-              -H "Host: ${DOMAIN}" \
-              "https://${DOMAIN}${URI_PATH}" 2>/dev/null || echo "999")
-            if [ "$t2" = "999" ]; then
-              return
-            fi
-            avg_ms=$(echo "scale=2; ($t1 + $t2) / 2 * 1000" | bc)
-            diff=$(echo "scale=2; ($t1 - $t2)" | bc | tr -d '-')
-            stable=$(echo "$diff < 0.3" | bc)
-            if [ "$stable" -eq 1 ]; then
-              echo "$ip $avg_ms"
-            fi
+
+            # 取三次的中位数（比双测抖动过滤更稳，也不需要额外判断"stable"）
+            median_ms=$(printf '%s\n' "${times[@]}" | sort -n | awk '
+              { a[NR]=$1 }
+              END {
+                if (NR % 2 == 1) m = a[(NR+1)/2]
+                else m = (a[NR/2] + a[NR/2+1]) / 2
+                printf "%.2f", m * 1000
+              }')
+
+            echo "$ip $median_ms $status"
           }
           export -f test_ip
 
-          # 3. 并行执行（并发数 50 即可，因为 IP 少了）
-          cat ip_list.txt | xargs -P 50 -I {} bash -c 'test_ip "$1"' _ {} > raw_result.txt || true
+          # 3. 并行执行
+          cat ip_list.txt | xargs -P "$CONCURRENCY" -I {} bash -c 'test_ip "$1"' _ {} > raw_result.txt || true
 
-          # 4. 排序取前 20
           total=$(wc -l < raw_result.txt 2>/dev/null || echo 0)
-          echo "✅ 有效可用 IP 数（已过滤抖动）：$total"
+          echo "✅ 有效可用 IP 数：$total"
           if [ "$total" -eq 0 ]; then
             echo "⚠️ 未找到可用 IP" > best_ips.txt
             echo "未找到" > best_ips_iponly.txt
             exit 0
           fi
 
-          sort -k2 -n raw_result.txt | head -20 > sorted.txt
+          # 4. 排序取前 N（按延迟中位数）
+          sort -k2 -n raw_result.txt | head -n "$TOP_N" > sorted.txt
 
           # 5. 生成结果文件
           awk '{printf "%-18s %.2f ms  #JP-GHv4 %02d\n", $1 ":443", $2, NR}' sorted.txt > best_ips.txt
-          n=1
-          while read ip delay; do
-            printf "%s#JP-GHv4 %02d\n" "${ip}:443" $n
-            ((n++))
-          done < sorted.txt > best_ips_iponly.txt
+          awk '{printf "%s:443#JP-GHv4 %02d\n", $1, NR}' sorted.txt > best_ips_iponly.txt
 
-          echo "--- 本次 Top 20 结果 ---"
+          echo "--- 本次 Top ${TOP_N} 结果 ---"
           cat best_ips.txt
 
       - name: 提交并推送结果
