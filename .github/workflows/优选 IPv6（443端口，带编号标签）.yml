@@ -1,4 +1,4 @@
-name: 优选 IPv6（443端口，TLS+HTTP双验证，带编号标签）
+name: 优选 IPv6（443端口，诊断+修复版）
 
 on:
   schedule:
@@ -15,30 +15,49 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v5
 
-      - name: IPv6 精准扫描（三次采样取中位数，强制覆盖三CIDR）
+      - name: 诊断 IPv6 出站能力
+        run: |
+          echo "===== 1. 检查本机是否有 IPv6 地址 ====="
+          ip -6 addr show || echo "❌ 无 IPv6 地址配置"
+
+          echo ""
+          echo "===== 2. 测试到公网 IPv6 的连通性 ====="
+          curl -6 -v --connect-timeout 5 --max-time 8 https://ipv6.google.com 2>&1 | tail -15 || echo "❌ IPv6 出站基础连通性失败"
+
+          echo ""
+          echo "===== 3. 测试到 Cloudflare IPv6 的连通性 ====="
+          curl -6 -v --connect-timeout 5 --max-time 8 "https://[2606:4700:4700::1111]" 2>&1 | tail -15 || echo "❌ 连不到 Cloudflare IPv6"
+
+          echo ""
+          echo "===== 4. 测试实际目标域名 + 手动指定一个 IPv6（带[]写法）====="
+          curl -v -k --connect-timeout 5 --max-time 8 \
+            --resolve "cmwk.eccome.ccwu.cc:443:[2606:4700:5a::1]" \
+            -H "Host: cmwk.eccome.ccwu.cc" \
+            "https://cmwk.eccome.ccwu.cc/proxyip=kr.william.us.ci" 2>&1 | tail -25 || echo "❌ 目标测试失败"
+
+          echo ""
+          echo "===== 诊断结束，请查看以上日志判断具体问题层级 ====="
+
+      - name: IPv6 精准扫描（三次采样，宽松状态码判断，[]包裹修复）
         run: |
           set -e
 
           # ==================== 你的实际配置 ====================
-          DOMAIN="cmwk.eccome.ccwu.cc"          # 改为你的实际域名
-          URI_PATH="/proxyip=kr.william.us.ci"  # 改为你的实际路径
-          EXPECT_STATUS="101,200,204"           # 认为"通"的 HTTP 状态码，按你 Worker 实际返回值调整
-          TOP_N=20                              # 最终取前多少个
-          PER_CIDR_MIN=5                        # 每个前缀至少强制保留几个（若不足则全取）
-          CONCURRENCY=100                       # 并发数
+          DOMAIN="cmwk.eccome.ccwu.cc"
+          URI_PATH="/proxyip=kr.william.us.ci"
+          TOP_N=20
+          PER_CIDR_MIN=5
+          CONCURRENCY=100
 
-          # 三个 IPv6 前缀，每个前缀只扫 ::1 ~ ::fe（256个地址空间中的一小段，
-          # 目的是控制扫描总量，不是这些前缀下真实可用IP只有这么多）
           prefixes=(
             "2606:4700:5a"
             "2606:4700:52"
             "2606:4700:57"
           )
-          export DOMAIN URI_PATH EXPECT_STATUS
+          export DOMAIN URI_PATH
           # =====================================================
 
           echo "🔍 目标域名: $DOMAIN, 路径: $URI_PATH"
-          echo "生成 IPv6 地址列表（每个前缀下 ::1 ~ ::fe）..."
 
           : > ip_list.txt
           for prefix in "${prefixes[@]}"; do
@@ -50,7 +69,9 @@ jobs:
           total_ips=$(wc -l < ip_list.txt)
           echo "📡 总待测 IPv6 数量：$total_ips"
 
-          # 测试函数：三次采样取中位数 + HTTP 状态码校验
+          # 测试函数：三次采样取中位数
+          # 状态码判断放宽为：只要不是 000（连接失败/超时）就算连通并记录延迟
+          # 同时把实际拿到的状态码也记下来，方便你事后看日志确认该收紧成哪些值
           test_ip() {
             ip=$1
             times=()
@@ -61,7 +82,7 @@ jobs:
                 --connect-timeout 1.5 \
                 --max-time 4 \
                 -k \
-                --resolve "${DOMAIN}:443:${ip}" \
+                --resolve "${DOMAIN}:443:[${ip}]" \
                 -H "Host: ${DOMAIN}" \
                 "https://${DOMAIN}${URI_PATH}" 2>/dev/null) || out="000 999"
 
@@ -74,10 +95,6 @@ jobs:
               fi
               times+=("$t")
             done
-
-            if [[ ",${EXPECT_STATUS}," != *",${status},"* ]]; then
-              return
-            fi
 
             median_ms=$(printf '%s\n' "${times[@]}" | sort -n | awk '
               { a[NR]=$1 }
@@ -96,13 +113,18 @@ jobs:
           total_available=$(wc -l < raw_result.txt 2>/dev/null || echo 0)
           echo "✅ 有效可用 IPv6 总数：$total_available"
 
+          # 打印状态码分布，帮你判断哪些码是"正常"的，后续可以再加回严格过滤
+          if [ "$total_available" -gt 0 ]; then
+            echo "--- 状态码分布 ---"
+            awk '{print $3}' raw_result.txt | sort | uniq -c | sort -rn
+          fi
+
           if [ "$total_available" -eq 0 ]; then
-            echo "⚠️ 未找到任何可用 IPv6 地址" > best_ips_v6.txt
+            echo "⚠️ 未找到任何可用 IPv6 地址（请查看上方诊断步骤日志确认原因）" > best_ips_v6.txt
             echo "未找到" > best_ips_iponly_v6.txt
             exit 0
           fi
 
-          # ----- 强制每个 CIDR 至少取 PER_CIDR_MIN 个（若不足则全取），再补齐至 TOP_N -----
           : > forced.txt
           total_forced=0
           for p in "${prefixes[@]}"; do
@@ -117,7 +139,6 @@ jobs:
             total_forced=$((total_forced + take))
           done
 
-          # 用 awk 一次性排除已强制选中的 IP（比 grep -f 逐行匹配更快更稳）
           awk '
             NR==FNR { forced[$1]=1; next }
             !($1 in forced)
@@ -140,8 +161,7 @@ jobs:
 
           cat best_ips_iponly_v6.txt
 
-          # 清理临时文件（不影响 git add，只是保持 workspace 干净）
-          rm -f ./*.all forced.txt forced_ips.txt raw_remaining.txt remaining_top.txt sorted.txt raw_result.txt ip_list.txt
+          rm -f ./*.all forced.txt raw_remaining.txt remaining_top.txt sorted.txt raw_result.txt ip_list.txt
 
       - name: 提交并推送结果
         run: |
