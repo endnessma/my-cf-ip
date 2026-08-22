@@ -15,34 +15,34 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v5
 
-      - name: IPv6 精准扫描（双测+抖动过滤，强制覆盖三CIDR）
+      - name: IPv6 精准扫描（三次采样取中位数，强制覆盖三CIDR）
         run: |
           set -e
-
-          # 安装 bc（浮点运算依赖）
-          sudo apt-get update
-          sudo apt-get install -y bc
 
           # ==================== 你的实际配置 ====================
           DOMAIN="cmwk.eccome.ccwu.cc"          # 改为你的实际域名
           URI_PATH="/proxyip=kr.william.us.ci"  # 改为你的实际路径
-          export DOMAIN URI_PATH
-          # =====================================================
+          EXPECT_STATUS="101,200,204"           # 认为"通"的 HTTP 状态码，按你 Worker 实际返回值调整
+          TOP_N=20                              # 最终取前多少个
+          PER_CIDR_MIN=5                        # 每个前缀至少强制保留几个（若不足则全取）
+          CONCURRENCY=100                       # 并发数
 
-          # 定义三个IPv6前缀（与要求一致）
+          # 三个 IPv6 前缀，每个前缀只扫 ::1 ~ ::fe（256个地址空间中的一小段，
+          # 目的是控制扫描总量，不是这些前缀下真实可用IP只有这么多）
           prefixes=(
             "2606:4700:5a"
             "2606:4700:52"
             "2606:4700:57"
           )
+          export DOMAIN URI_PATH EXPECT_STATUS
+          # =====================================================
 
           echo "🔍 目标域名: $DOMAIN, 路径: $URI_PATH"
           echo "生成 IPv6 地址列表（每个前缀下 ::1 ~ ::fe）..."
 
-          # 生成IP列表
-          > ip_list.txt
+          : > ip_list.txt
           for prefix in "${prefixes[@]}"; do
-            for i in {1..254}; do
+            for i in $(seq 1 254); do
               printf "%s::%x\n" "$prefix" "$i"
             done
           done >> ip_list.txt
@@ -50,48 +50,51 @@ jobs:
           total_ips=$(wc -l < ip_list.txt)
           echo "📡 总待测 IPv6 数量：$total_ips"
 
-          # 测试函数：双次测量，取平均，过滤抖动（>300ms丢弃）
+          # 测试函数：三次采样取中位数 + HTTP 状态码校验
           test_ip() {
             ip=$1
-            # 第一次测试（使用 --resolve 强制解析）
-            t1=$(curl -o /dev/null -s -w "%{time_total}" \
-              --connect-timeout 1.5 \
-              --max-time 4 \
-              -k \
-              --resolve "${DOMAIN}:443:${ip}" \
-              -H "Host: ${DOMAIN}" \
-              "https://${DOMAIN}${URI_PATH}" 2>/dev/null || echo "999")
-            if [ "$t1" = "999" ] || [ "$t1" = "0.000" ]; then
+            times=()
+            status=""
+            for n in 1 2 3; do
+              out=$(curl -o /dev/null -s \
+                -w "%{http_code} %{time_total}" \
+                --connect-timeout 1.5 \
+                --max-time 4 \
+                -k \
+                --resolve "${DOMAIN}:443:${ip}" \
+                -H "Host: ${DOMAIN}" \
+                "https://${DOMAIN}${URI_PATH}" 2>/dev/null) || out="000 999"
+
+              code=$(echo "$out" | awk '{print $1}')
+              t=$(echo "$out" | awk '{print $2}')
+              [ -z "$status" ] && status="$code"
+
+              if [ "$code" = "000" ]; then
+                return
+              fi
+              times+=("$t")
+            done
+
+            if [[ ",${EXPECT_STATUS}," != *",${status},"* ]]; then
               return
             fi
-            # 第二次测试
-            t2=$(curl -o /dev/null -s -w "%{time_total}" \
-              --connect-timeout 1.5 \
-              --max-time 4 \
-              -k \
-              --resolve "${DOMAIN}:443:${ip}" \
-              -H "Host: ${DOMAIN}" \
-              "https://${DOMAIN}${URI_PATH}" 2>/dev/null || echo "999")
-            if [ "$t2" = "999" ]; then
-              return
-            fi
-            # 计算平均延迟（毫秒）
-            avg_ms=$(echo "scale=2; ($t1 + $t2) / 2 * 1000" | bc)
-            # 计算抖动（绝对值）
-            diff=$(echo "scale=2; ($t1 - $t2)" | bc | tr -d '-')
-            # 抖动阈值：超过 300ms 则丢弃
-            stable=$(echo "$diff < 0.3" | bc)
-            if [ "$stable" -eq 1 ]; then
-              echo "$ip $avg_ms"
-            fi
+
+            median_ms=$(printf '%s\n' "${times[@]}" | sort -n | awk '
+              { a[NR]=$1 }
+              END {
+                if (NR % 2 == 1) m = a[(NR+1)/2]
+                else m = (a[NR/2] + a[NR/2+1]) / 2
+                printf "%.2f", m * 1000
+              }')
+
+            echo "$ip $median_ms $status"
           }
           export -f test_ip
 
-          # 并行执行所有测试
-          cat ip_list.txt | xargs -P 50 -I {} bash -c 'test_ip "$1"' _ {} > raw_result.txt || true
+          cat ip_list.txt | xargs -P "$CONCURRENCY" -I {} bash -c 'test_ip "$1"' _ {} > raw_result.txt || true
 
           total_available=$(wc -l < raw_result.txt 2>/dev/null || echo 0)
-          echo "✅ 有效可用 IPv6 总数（已过滤抖动）：$total_available"
+          echo "✅ 有效可用 IPv6 总数：$total_available"
 
           if [ "$total_available" -eq 0 ]; then
             echo "⚠️ 未找到任何可用 IPv6 地址" > best_ips_v6.txt
@@ -99,45 +102,46 @@ jobs:
             exit 0
           fi
 
-          # ----- 强制每个CIDR至少取5个（若不足则全取），再补齐至20 -----
-          > forced.txt
+          # ----- 强制每个 CIDR 至少取 PER_CIDR_MIN 个（若不足则全取），再补齐至 TOP_N -----
+          : > forced.txt
           total_forced=0
           for p in "${prefixes[@]}"; do
-            grep "^${p}" raw_result.txt | sort -k2 -n > "${p}.all"
-            count=$(wc -l < "${p}.all")
+            grep "^${p}" raw_result.txt | sort -k2 -n > "${p//:/_}.all"
+            count=$(wc -l < "${p//:/_}.all")
             if [ "$count" -eq 0 ]; then
               echo "⚠️ CIDR ${p}::/48 无可用IP"
               continue
             fi
-            take=$(( count < 5 ? count : 5 ))
-            head -n "$take" "${p}.all" >> forced.txt
+            take=$(( count < PER_CIDR_MIN ? count : PER_CIDR_MIN ))
+            head -n "$take" "${p//:/_}.all" >> forced.txt
             total_forced=$((total_forced + take))
           done
 
-          # 从全部结果中排除强制选出的IP
-          awk '{print $1}' forced.txt > forced_ips.txt
-          grep -v -F -f forced_ips.txt raw_result.txt > raw_remaining.txt
+          # 用 awk 一次性排除已强制选中的 IP（比 grep -f 逐行匹配更快更稳）
+          awk '
+            NR==FNR { forced[$1]=1; next }
+            !($1 in forced)
+          ' forced.txt raw_result.txt > raw_remaining.txt
 
-          # 计算需要补足的数量（目标20）
-          need=$((20 - total_forced))
-          if [ $need -gt 0 ]; then
-            sort -k2 -n raw_remaining.txt | head -n $need > remaining_top.txt
+          need=$((TOP_N - total_forced))
+          if [ "$need" -gt 0 ]; then
+            sort -k2 -n raw_remaining.txt | head -n "$need" > remaining_top.txt
           else
-            > remaining_top.txt
+            : > remaining_top.txt
           fi
 
-          # 合并并按延迟排序，取前20（实际可能不足20）
-          cat forced.txt remaining_top.txt | sort -k2 -n | head -20 > sorted.txt
+          cat forced.txt remaining_top.txt | sort -k2 -n | head -n "$TOP_N" > sorted.txt
 
           final_count=$(wc -l < sorted.txt)
           echo "📋 最终优选 IPv6（强制覆盖三CIDR，共 $final_count 个）："
 
-          # 生成带延迟和编号的结果
           awk '{printf "[%s]:443  %.2f ms  #JP-GHv6 %02d\n", $1, $2, NR}' sorted.txt > best_ips_v6.txt
           awk '{printf "[%s]:443#JP-GHv6 %02d\n", $1, NR}' sorted.txt > best_ips_iponly_v6.txt
 
-          # 打印到日志
           cat best_ips_iponly_v6.txt
+
+          # 清理临时文件（不影响 git add，只是保持 workspace 干净）
+          rm -f ./*.all forced.txt forced_ips.txt raw_remaining.txt remaining_top.txt sorted.txt raw_result.txt ip_list.txt
 
       - name: 提交并推送结果
         run: |
