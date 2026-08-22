@@ -24,7 +24,7 @@ jobs:
           sudo apt-get install -y bc
 
           # ==================== 你的实际配置 ====================
-          DOMAIN="cmwk.eccome.ccwu.cc"          # 改为你的实际域名
+          DOMAIN="cmpg.endnessma.cc.cd"          # 改为你的实际域名
           URI_PATH="/proxyip=kr.william.us.ci"  # 改为你的实际路径
           export DOMAIN URI_PATH
           # =====================================================
