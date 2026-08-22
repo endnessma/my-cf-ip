@@ -1,4 +1,4 @@
-name: 电信优选 IPv4（XHTTP精准扫描 - 限定两段）
+name: 电信优选 IPv4（双CIDR强制覆盖，各至少10个）
 
 on:
   schedule:
@@ -15,7 +15,7 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v5
 
-      - name: 精准扫描（TLS+HTTP验证，抖动过滤）
+      - name: 精准扫描（强制两段各至少10个，不足全取）
         run: |
           set -e
 
@@ -29,22 +29,27 @@ jobs:
           export DOMAIN URI_PATH
           # =====================================================
 
-          echo "🔍 目标域名: $DOMAIN, 路径: $URI_PATH"
+          # 定义两个 CIDR 的前缀（匹配 IP 开头）
+          prefixes=(
+            "172.64.229"
+            "104.18.33"
+          )
 
-          # 1. 只生成两个指定 C 段的 IP 列表
-          echo "正在生成 IP 池（仅 172.64.229.* 和 104.18.33.*）..."
+          echo "🔍 目标域名: $DOMAIN, 路径: $URI_PATH"
+          echo "正在生成 IP 池（${prefixes[*]}）..."
+
+          # 生成 IP 列表
           rm -f ip_list.txt
-          for i in {1..254}; do
-            echo "172.64.229.$i"
-          done >> ip_list.txt
-          for i in {1..254}; do
-            echo "104.18.33.$i"
+          for prefix in "${prefixes[@]}"; do
+            for i in {1..254}; do
+              echo "${prefix}.$i"
+            done
           done >> ip_list.txt
 
           total_ips=$(wc -l < ip_list.txt)
           echo "📡 总待测 IP 数量：$total_ips"
 
-          # 2. 测试函数（双测+抖动过滤）
+          # 测试函数（双测+抖动过滤）
           test_ip() {
             ip=$1
             t1=$(curl -o /dev/null -s -w "%{time_total}" \
@@ -76,21 +81,55 @@ jobs:
           }
           export -f test_ip
 
-          # 3. 并行执行（并发数 50 即可，因为 IP 少了）
+          # 并行测试所有 IP
           cat ip_list.txt | xargs -P 50 -I {} bash -c 'test_ip "$1"' _ {} > raw_result.txt || true
 
-          # 4. 排序取前 20
-          total=$(wc -l < raw_result.txt 2>/dev/null || echo 0)
-          echo "✅ 有效可用 IP 数（已过滤抖动）：$total"
-          if [ "$total" -eq 0 ]; then
-            echo "⚠️ 未找到可用 IP" > best_ips.txt
+          total_available=$(wc -l < raw_result.txt 2>/dev/null || echo 0)
+          echo "✅ 有效可用 IP 总数（已过滤抖动）：$total_available"
+
+          if [ "$total_available" -eq 0 ]; then
+            echo "⚠️ 未找到任何可用 IP" > best_ips.txt
             echo "未找到" > best_ips_iponly.txt
             exit 0
           fi
 
-          sort -k2 -n raw_result.txt | head -20 > sorted.txt
+          # ----- 强制每个 CIDR 至少取 10 个（不足则全取，最低0） -----
+          FORCED_PER_CIDR=10   # 每个CIDR强制取的数量
+          TARGET=20            # 最终输出总数
+          > forced.txt
+          total_forced=0
+          for p in "${prefixes[@]}"; do
+            grep "^${p}" raw_result.txt | sort -k2 -n > "${p}.all"
+            count=$(wc -l < "${p}.all")
+            if [ "$count" -eq 0 ]; then
+              echo "⚠️ CIDR ${p}.0/24 无可用 IP"
+              continue
+            fi
+            # 取 min(count, FORCED_PER_CIDR)，即不足则全取
+            take=$(( count < FORCED_PER_CIDR ? count : FORCED_PER_CIDR ))
+            head -n "$take" "${p}.all" >> forced.txt
+            total_forced=$((total_forced + take))
+          done
 
-          # 5. 生成结果文件
+          # 从全部结果中排除强制选出的 IP
+          awk '{print $1}' forced.txt > forced_ips.txt
+          grep -v -F -f forced_ips.txt raw_result.txt > raw_remaining.txt
+
+          # 计算需要补足的数量（目标 TARGET）
+          need=$((TARGET - total_forced))
+          if [ $need -gt 0 ]; then
+            sort -k2 -n raw_remaining.txt | head -n $need > remaining_top.txt
+          else
+            > remaining_top.txt
+          fi
+
+          # 合并并按延迟排序，取前 TARGET（实际可能不足）
+          cat forced.txt remaining_top.txt | sort -k2 -n | head -$TARGET > sorted.txt
+
+          final_count=$(wc -l < sorted.txt)
+          echo "📋 最终优选 IP（强制两段各至少10个，共 $final_count 个）："
+
+          # 生成结果文件
           awk '{printf "%-18s %.2f ms  #电信优选 %02d\n", $1 ":443", $2, NR}' sorted.txt > best_ips.txt
           n=1
           while read ip delay; do
@@ -98,7 +137,7 @@ jobs:
             ((n++))
           done < sorted.txt > best_ips_iponly.txt
 
-          echo "--- 本次 Top 20 结果 ---"
+          echo "--- 本次 Top 结果 ---"
           cat best_ips.txt
 
       - name: 提交并推送结果
@@ -106,5 +145,5 @@ jobs:
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.github.com"
           git add best_ips.txt best_ips_iponly.txt
-          git diff --staged --quiet || git commit -m "自动更新电信优选IP $(date +'%Y-%m-%d %H:%M:%S')"
+          git diff --staged --quiet || git commit -m "自动更新电信优选IP（强制每段至少10个） $(date +'%Y-%m-%d %H:%M:%S')"
           git push
