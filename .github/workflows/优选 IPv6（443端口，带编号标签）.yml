@@ -133,8 +133,8 @@ jobs:
           echo "📋 最终优选 IPv6（强制覆盖三CIDR，共 $final_count 个）："
 
           # 生成带延迟和编号的结果
-          awk '{printf "[%s]:443  %.2f ms  #电信IPv6 %02d\n", $1, $2, NR}' sorted.txt > best_ips_v6.txt
-          awk '{printf "[%s]:443#电信IPv6 %02d\n", $1, NR}' sorted.txt > best_ips_iponly_v6.txt
+          awk '{printf "[%s]:443  %.2f ms  #JP-GHv6 %02d\n", $1, $2, NR}' sorted.txt > best_ips_v6.txt
+          awk '{printf "[%s]:443#JP-GHv6 %02d\n", $1, NR}' sorted.txt > best_ips_iponly_v6.txt
 
           # 打印到日志
           cat best_ips_iponly_v6.txt
