@@ -2,7 +2,7 @@ name: 电信优选 IPv4（XHTTP精准扫描 - 限定两段）
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 jobs:
